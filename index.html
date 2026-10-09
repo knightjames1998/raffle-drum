@@ -564,7 +564,7 @@ button{touch-action:manipulation}
         </details>
       </section>
 
-      <p class="fine">Each ticket is one ball. Winners are picked with your browser's cryptographic random number generator, so every ball in the drum has the same chance. A winner's remaining balls leave the drum, so nobody wins twice.</p>
+      <p class="fine">Each ticket is one ball. Above 2,000 tickets, each ball stands for a few tickets so the drum stays smooth, but the winner is still drawn from every ticket. Winners are picked with your browser's cryptographic random number generator, so every ticket has the same chance. A winner's remaining tickets leave the drum, so nobody wins twice.</p>
     </aside>
   </main>
 </div>
@@ -839,9 +839,9 @@ function refresh(){
   } else if(!total){
     els.stageCount.textContent = 'Give at least one person a ticket to start.';
   } else {
-    els.stageCount.innerHTML = `<b>${total}</b> ${total === 1 ? 'ball' : 'balls'}<span class="long"> in the drum</span> · <b>${people}</b> ${people === 1 ? 'person' : 'people'}`;
+    els.stageCount.innerHTML = `<b>${total}</b> ${ballWord(total)}<span class="long"> in the drum</span> · <b>${people}</b> ${people === 1 ? 'person' : 'people'}`;
   }
-  els.canvas.setAttribute('aria-label', `Raffle drum, ${state.view} view, holding ${total} ${total === 1 ? 'ball' : 'balls'}`);
+  els.canvas.setAttribute('aria-label', `Raffle drum, ${state.view} view, holding ${total} ${ballWord(total)}`);
 
   els.badgeEntries.textContent = state.entrants.length;
   els.badgeEntries.hidden = !state.entrants.length;
@@ -1004,7 +1004,7 @@ function renderWhosIn(){
   const act = state.entrants.filter(e => !e.wonAt && e.tickets > 0)
     .sort((a, b) => b.tickets - a.tickets || a.name.localeCompare(b.name, undefined, { sensitivity:'base' }));
   const total = act.reduce((t, e) => t + e.tickets, 0), max = act.length ? act[0].tickets : 1;
-  els.wiSub.textContent = `${act.length} ${act.length === 1 ? 'person' : 'people'} · ${total} ${total === 1 ? 'ball' : 'balls'}`;
+  els.wiSub.textContent = `${act.length} ${act.length === 1 ? 'person' : 'people'} · ${total} ${ballWord(total)}`;
   els.wiList.textContent = '';
   if(!act.length){
     const p = document.createElement('li');
@@ -1440,6 +1440,25 @@ function confettiTick(){
 const ctx = els.canvas.getContext('2d');
 let dpr = 1, W = 0, H = 0, geo = null, side = null, C = {};
 const sprites = new Map();
+// Every ball image lives on one shared sheet, so thousands of balls are drawn from a single image.
+// Drawing from many separate small images is what slows some browsers (notably Safari) down.
+const ATLAS = 2048;
+let atlas = null, atlasCtx = null, atlasX = 0, atlasY = 0, atlasRow = 0;
+function atlasReset(){
+  if(!atlas){ atlas = document.createElement('canvas'); atlas.width = atlas.height = ATLAS; atlasCtx = atlas.getContext('2d'); }
+  atlasCtx.setTransform(1, 0, 0, 1, 0, 0);
+  atlasCtx.clearRect(0, 0, ATLAS, ATLAS);
+  atlasX = atlasY = atlasRow = 0;
+}
+function atlasSlot(size){
+  if(!atlas) atlasReset();
+  if(atlasX + size > ATLAS){ atlasX = 0; atlasY += atlasRow + 2; atlasRow = 0; }
+  if(atlasY + size > ATLAS) return null;
+  const slot = { x:atlasX, y:atlasY };
+  atlasX += size + 2;
+  if(size > atlasRow) atlasRow = size;
+  return slot;
+}
 
 // Side view: a wire cage on a horizontal axle, seen from three-quarters with a slight downward look.
 // Simulation coordinates: ax runs along the axle, x across the drum face, y downward. Drum radius is 1.
@@ -1460,7 +1479,7 @@ function P(ax, x, y){
 const relDepth = (x, y) => x * SIDE.pc * SIDE.ec - y * SIDE.es;
 
 let spriteGen = 0, loadBucket = 0;
-function clearSprites(){ sprites.clear(); spriteGen++; forceRender = true; }
+function clearSprites(){ sprites.clear(); spriteGen++; forceRender = true; atlasReset(); }
 function readColors(){
   const cs = getComputedStyle(document.documentElement);
   const g = k => cs.getPropertyValue(k).trim();
@@ -1471,7 +1490,7 @@ function readColors(){
 function resize(){
   const r = els.wrap.getBoundingClientRect();
   // With thousands of balls, draw the drum at a slightly lower resolution to keep it smooth
-  const nd = Math.min(loadBucket ? 1.5 : 2.5, window.devicePixelRatio || 1);
+  const nd = Math.min(loadBucket ? 2 : 2.5, window.devicePixelRatio || 1);
   if(nd !== dpr) clearSprites();
   dpr = nd;
   forceRender = true;
@@ -1503,13 +1522,13 @@ function sprite(color, label, r, shade){
   const key = color + '|' + label + '|' + rq + '|' + shade;
   let s = sprites.get(key);
   if(s) return s;
-  if(sprites.size > 3000) sprites.clear();
   const px = Math.ceil((rq * 2 + 2) * dpr);
-  const cv = document.createElement('canvas');
-  cv.width = cv.height = px;
-  const g = cv.getContext('2d');
-  g.scale(dpr, dpr);
-  const o = px / dpr / 2;
+  let slot = sprites.size > 4000 ? null : atlasSlot(px);
+  if(!slot){ clearSprites(); slot = atlasSlot(px); }
+  if(!slot) return null;
+  const g = atlasCtx, o = px / dpr / 2;
+  g.save();
+  g.setTransform(dpr, 0, 0, dpr, slot.x, slot.y);
   g.beginPath(); g.arc(o, o, rq, 0, TAU); g.fillStyle = color; g.fill();
   const gr = g.createRadialGradient(o - rq * 0.35, o - rq * 0.4, rq * 0.05, o, o, rq);
   gr.addColorStop(0, 'rgba(255,255,255,0.5)');
@@ -1529,9 +1548,9 @@ function sprite(color, label, r, shade){
     g.globalCompositeOperation = 'source-atop';
     g.fillStyle = `rgba(14,11,12,${(shade * 0.09).toFixed(2)})`;
     g.fillRect(0, 0, o * 2, o * 2);
-    g.globalCompositeOperation = 'source-over';
   }
-  s = { c:cv, size:px / dpr };
+  g.restore();
+  s = { x:slot.x, y:slot.y, px, size:px / dpr };
   sprites.set(key, s);
   return s;
 }
@@ -1541,23 +1560,29 @@ function infoSprite(info, r, shade){
   const rq = Math.max(1.5, Math.round(r * 2) / 2), lab = r >= 8;
   const key = rq * 32 + shade * 2 + (lab ? 1 : 0);
   let sp = info.cache.get(key);
-  if(!sp){ sp = sprite(info.color, lab ? info.label : '', rq, shade); info.cache.set(key, sp); }
+  if(!sp){ sp = sprite(info.color, lab ? info.label : '', rq, shade); if(sp) info.cache.set(key, sp); }
   return sp;
 }
 function blit(sp, x, y, alpha){
+  if(!sp) return;
   const h = sp.size / 2;
-  if(alpha < 1){ ctx.globalAlpha = alpha; ctx.drawImage(sp.c, x - h, y - h, sp.size, sp.size); ctx.globalAlpha = 1; }
-  else ctx.drawImage(sp.c, x - h, y - h, sp.size, sp.size);
+  if(alpha < 1){ ctx.globalAlpha = alpha; ctx.drawImage(atlas, sp.x, sp.y, sp.px, sp.px, x - h, y - h, sp.size, sp.size); ctx.globalAlpha = 1; }
+  else ctx.drawImage(atlas, sp.x, sp.y, sp.px, sp.px, x - h, y - h, sp.size, sp.size);
 }
 function drawBall(color, label, x, y, r, alpha){
   if(r < 0.6) return;
-  const sp = sprite(color, r >= 8 ? label : '', r);
-  ctx.globalAlpha = alpha;
-  ctx.drawImage(sp.c, x - sp.size / 2, y - sp.size / 2, sp.size, sp.size);
-  ctx.globalAlpha = 1;
+  blit(sprite(color, r >= 8 ? label : '', r), x, y, alpha);
 }
 
 /* ---------- Drum: physics ---------- */
+// Above this many tickets, each ball stands for a few tickets so the drum stays smooth on any device.
+// Winners are still drawn from the full ticket list, so the odds don't change.
+const MAX_BALLS = 2000;
+const allTickets = () => state.entrants.reduce((t, e) => t + e.tickets, 0);
+const ballsScaled = () => allTickets() > MAX_BALLS;
+function ballWord(n){
+  return ballsScaled() ? (n === 1 ? 'ticket' : 'tickets') : (n === 1 ? 'ball' : 'balls');
+}
 let balls = [];
 let rrFront = 0.12, rrSide = 0.16, targetRR = 0.16;
 let spin = 0, drumAngle = 0, glow = 0;
@@ -1580,7 +1605,10 @@ function newBall(eid, mode){
 function syncBalls(){
   if(!(phase === 'idle' || phase === 'landed')){ pendingSync = true; return; }
   pendingSync = false;
-  const want = new Map(state.entrants.map(e => [e.id, e.wonAt ? 0 : e.tickets]));
+  // The ratio uses every ticket, drawn or not, so other people's balls don't change after each draw
+  const all = allTickets(), scale = all > MAX_BALLS ? MAX_BALLS / all : 1;
+  const want = new Map(state.entrants.map(e => [e.id,
+    e.wonAt || e.tickets <= 0 ? 0 : scale < 1 ? Math.max(1, Math.round(e.tickets * scale)) : e.tickets]));
   const have = new Map();
   for(const b of balls){
     if(b.dying) continue;
@@ -1596,7 +1624,7 @@ function syncBalls(){
   for(const w of want.values()) count += w;
   const n = Math.max(1, count);
   const prevRR = targetRR;
-  rrFront = clamp(Math.sqrt(0.32 / n), 0.02, 0.15);
+  rrFront = clamp(Math.sqrt(0.32 / n), 0.011, 0.15);
   rrSide = clamp(Math.cbrt(0.24 * SIDE.hl / n), 0.035, 0.17);
   targetRR = state.view === 'side' ? rrSide : rrFront;
   let adding = 0;
@@ -1609,7 +1637,7 @@ function syncBalls(){
   }
   firstSync = false;
   if(adding || removed || prevRR !== targetRR) wake();
-  const bucket = count > 2500 ? 1 : 0;
+  const bucket = count > 1500 ? 1 : 0;
   if(bucket !== loadBucket){ loadBucket = bucket; resize(); }
 }
 
@@ -1648,6 +1676,23 @@ function gridReset(cells, n){
   if(gNext.length < n){ gNext = new Int32Array(Math.ceil(n * 1.5)); gCell = new Int32Array(gNext.length); }
   gHead.fill(-1, 0, cells);
 }
+function pair2(b, o){
+  let nx = o.x - b.x, ny = o.y - b.y;
+  const rs = b.rr + o.rr, d2 = nx * nx + ny * ny;
+  if(d2 >= rs * rs) return;
+  let dist;
+  if(d2 < 1e-12){ const ang = Math.random() * TAU; nx = Math.cos(ang); ny = Math.sin(ang); dist = 0; }
+  else { dist = Math.sqrt(d2); nx /= dist; ny /= dist; }
+  const pen = (rs - dist) * 0.5;
+  b.x -= nx * pen; b.y -= ny * pen; o.x += nx * pen; o.y += ny * pen;
+  const rv = (o.vx - b.vx) * nx + (o.vy - b.vy) * ny;
+  if(rv < 0){
+    const imp = -(1 + restit) * rv * 0.5;
+    b.vx -= imp * nx; b.vy -= imp * ny; o.vx += imp * nx; o.vy += imp * ny;
+  }
+}
+// Each pair of neighbouring cells is visited from one side only, so every pair is checked once
+const FWD2 = [1, -1, 1, 0, 1, 1, 0, 1];
 function collide(list){
   const n = list.length;
   if(n < 2) return;
@@ -1665,28 +1710,11 @@ function collide(list){
   }
   for(let i = 0; i < n; i++){
     const b = list[i], c = gCell[i], cx = (c / nc) | 0, cy = c - cx * nc;
-    const x0 = cx > 0 ? cx - 1 : 0, x1 = cx < nc - 1 ? cx + 1 : cx;
-    const y0 = cy > 0 ? cy - 1 : 0, y1 = cy < nc - 1 ? cy + 1 : cy;
-    for(let gx = x0; gx <= x1; gx++){
-      for(let gy = y0; gy <= y1; gy++){
-        for(let j = gHead[gx * nc + gy]; j !== -1; j = gNext[j]){
-          if(j <= i) continue;
-          const o = list[j];
-          let nx = o.x - b.x, ny = o.y - b.y;
-          const rs = b.rr + o.rr, d2 = nx * nx + ny * ny;
-          if(d2 >= rs * rs) continue;
-          let dist;
-          if(d2 < 1e-12){ const ang = Math.random() * TAU; nx = Math.cos(ang); ny = Math.sin(ang); dist = 0; }
-          else { dist = Math.sqrt(d2); nx /= dist; ny /= dist; }
-          const pen = (rs - dist) * 0.5;
-          b.x -= nx * pen; b.y -= ny * pen; o.x += nx * pen; o.y += ny * pen;
-          const rv = (o.vx - b.vx) * nx + (o.vy - b.vy) * ny;
-          if(rv < 0){
-            const imp = -(1 + restit) * rv * 0.5;
-            b.vx -= imp * nx; b.vy -= imp * ny; o.vx += imp * nx; o.vy += imp * ny;
-          }
-        }
-      }
+    for(let j = gNext[i]; j !== -1; j = gNext[j]) pair2(b, list[j]);
+    for(let k = 0; k < 8; k += 2){
+      const x2 = cx + FWD2[k], y2 = cy + FWD2[k + 1];
+      if(x2 < 0 || x2 >= nc || y2 < 0 || y2 >= nc) continue;
+      for(let j = gHead[x2 * nc + y2]; j !== -1; j = gNext[j]) pair2(b, list[j]);
     }
   }
 }
@@ -1728,6 +1756,28 @@ function stepSide(list, h){
   wallsSide(list, s);
 }
 
+function pair3(b, o){
+  let nx = o.x - b.x, ny = o.y - b.y, nz = o.ax - b.ax;
+  const rs = b.rr + o.rr, d2 = nx * nx + ny * ny + nz * nz;
+  if(d2 >= rs * rs) return;
+  let dist;
+  if(d2 < 1e-12){ const ang = Math.random() * TAU; nx = Math.cos(ang); ny = 0; nz = Math.sin(ang); dist = 0; }
+  else { dist = Math.sqrt(d2); nx /= dist; ny /= dist; nz /= dist; }
+  const pen = (rs - dist) * 0.5;
+  b.x -= nx * pen; b.y -= ny * pen; b.ax -= nz * pen;
+  o.x += nx * pen; o.y += ny * pen; o.ax += nz * pen;
+  const rv = (o.vx - b.vx) * nx + (o.vy - b.vy) * ny + (o.vax - b.vax) * nz;
+  if(rv < 0){
+    const imp = -(1 + restit) * rv * 0.5;
+    b.vx -= imp * nx; b.vy -= imp * ny; b.vax -= imp * nz;
+    o.vx += imp * nx; o.vy += imp * ny; o.vax += imp * nz;
+  }
+}
+// The 13 neighbouring cells that come "after" a cell; the other 13 are covered from their side
+const FWD3 = [];
+for(let dx = -1; dx <= 1; dx++) for(let dy = -1; dy <= 1; dy++) for(let dz = -1; dz <= 1; dz++){
+  if(dx > 0 || (dx === 0 && (dy > 0 || (dy === 0 && dz > 0)))) FWD3.push(dx, dy, dz);
+}
 function collide3(list){
   const n = list.length;
   if(n < 2) return;
@@ -1747,34 +1797,11 @@ function collide3(list){
   }
   for(let i = 0; i < n; i++){
     const b = list[i], c = gCell[i], cz = c % nz, t = (c - cz) / nz, cy = t % nc, cx = (t - cy) / nc;
-    const x0 = cx > 0 ? cx - 1 : 0, x1 = cx < nc - 1 ? cx + 1 : cx;
-    const y0 = cy > 0 ? cy - 1 : 0, y1 = cy < nc - 1 ? cy + 1 : cy;
-    const z0 = cz > 0 ? cz - 1 : 0, z1 = cz < nz - 1 ? cz + 1 : cz;
-    for(let gx = x0; gx <= x1; gx++){
-      for(let gy = y0; gy <= y1; gy++){
-        const row = (gx * nc + gy) * nz;
-        for(let gz = z0; gz <= z1; gz++){
-          for(let j = gHead[row + gz]; j !== -1; j = gNext[j]){
-            if(j <= i) continue;
-            const o = list[j];
-            let nx = o.x - b.x, ny = o.y - b.y, nzv = o.ax - b.ax;
-            const rs = b.rr + o.rr, d2 = nx * nx + ny * ny + nzv * nzv;
-            if(d2 >= rs * rs) continue;
-            let dist;
-            if(d2 < 1e-12){ const ang = Math.random() * TAU; nx = Math.cos(ang); ny = 0; nzv = Math.sin(ang); dist = 0; }
-            else { dist = Math.sqrt(d2); nx /= dist; ny /= dist; nzv /= dist; }
-            const pen = (rs - dist) * 0.5;
-            b.x -= nx * pen; b.y -= ny * pen; b.ax -= nzv * pen;
-            o.x += nx * pen; o.y += ny * pen; o.ax += nzv * pen;
-            const rv = (o.vx - b.vx) * nx + (o.vy - b.vy) * ny + (o.vax - b.vax) * nzv;
-            if(rv < 0){
-              const imp = -(1 + restit) * rv * 0.5;
-              b.vx -= imp * nx; b.vy -= imp * ny; b.vax -= imp * nzv;
-              o.vx += imp * nx; o.vy += imp * ny; o.vax += imp * nzv;
-            }
-          }
-        }
-      }
+    for(let j = gNext[i]; j !== -1; j = gNext[j]) pair3(b, list[j]);
+    for(let k = 0; k < 39; k += 3){
+      const x2 = cx + FWD3[k], y2 = cy + FWD3[k + 1], z2 = cz + FWD3[k + 2];
+      if(x2 < 0 || x2 >= nc || y2 < 0 || y2 >= nc || z2 < 0 || z2 >= nz) continue;
+      for(let j = gHead[(x2 * nc + y2) * nz + z2]; j !== -1; j = gNext[j]) pair3(b, list[j]);
     }
   }
 }
@@ -1973,7 +2000,7 @@ function renderFront(){
   for(let i = 0, n = balls.length; i < n; i++){
     const b = balls[i], info = infoMap.get(b.eid);
     if(!info) continue;
-    const r = b.rr * R;
+    const r = targetRR * R;
     if(r < 0.6) continue;
     blit(infoSprite(info, r, 0), cx + b.x * R, cy + b.y * R, b.alpha);
   }
@@ -2216,17 +2243,20 @@ function renderSide(){
     for(let i = 0; i < n; i++) sOrder[i] = i;
     sOrder.sort((a, c) => sD[a] - sD[c]);
   } else {
+    let moves = 0;
+    const limit = n * 6;
     for(let i = 1; i < n; i++){
       const v = sOrder[i], d = sD[v];
       let j = i - 1;
-      while(j >= 0 && sD[sOrder[j]] > d){ sOrder[j + 1] = sOrder[j]; j--; }
+      while(j >= 0 && sD[sOrder[j]] > d){ sOrder[j + 1] = sOrder[j]; j--; moves++; }
       sOrder[j + 1] = v;
+      if(moves > limit){ sOrder.sort((a, c) => sD[a] - sD[c]); break; }
     }
   }
   for(let k = 0; k < n; k++){
     const i = sOrder[k], b = balls[i], info = infoMap.get(b.eid);
     if(!info) continue;
-    const d = sD[i], r = b.rr * R * (1 + d * 0.05);
+    const d = sD[i], r = targetRR * R * (1 + d * 0.05);
     if(r < 0.6) continue;
     const shade = Math.round(clamp((0.25 - d) * 0.2, 0, 0.36) / 0.09);
     blit(infoSprite(info, r, shade), sX[i], sY[i], b.alpha);
@@ -2338,7 +2368,7 @@ function reveal(){
   els.winName.textContent = name;
   els.winMeta.textContent = `${w.tickets} of ${w.total} ${w.total === 1 ? 'ticket' : 'tickets'} · ${fmtPct(w.tickets / w.total)} odds`;
   const rest = w.tickets - 1;
-  els.winNote.textContent = rest > 0 ? `Their other ${rest} ${rest === 1 ? 'ball' : 'balls'} came out of the drum.` : '';
+  els.winNote.textContent = rest > 0 ? `Their other ${rest} ${ballWord(rest)} came out of the drum.` : '';
   els.winNote.hidden = rest <= 0;
 
   setEditing(true);
