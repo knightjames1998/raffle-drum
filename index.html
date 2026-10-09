@@ -795,6 +795,7 @@ function renderRows(){
 
 function refresh(){
   infoMap = new Map(state.entrants.map(e => [e.id, { color:e.color, label:initials(e.name) }]));
+  forceRender = true;
   const groups = dupGroups(), dupIds = new Set(groups.flat().map(e => e.id));
   const act = active();
   const total = act.reduce((s,e) => s + e.tickets, 0);
@@ -1458,18 +1459,22 @@ function P(ax, x, y){
 }
 const relDepth = (x, y) => x * SIDE.pc * SIDE.ec - y * SIDE.es;
 
+let spriteGen = 0, loadBucket = 0;
+function clearSprites(){ sprites.clear(); spriteGen++; forceRender = true; }
 function readColors(){
   const cs = getComputedStyle(document.documentElement);
   const g = k => cs.getPropertyValue(k).trim();
   C = { rim:g('--rim') || '#4D4447', rimHi:g('--rim-hi') || '#948A8D', accent:g('--accent') || '#A8232A', face:g('--ball-face') || '#FBF9F9', ink:g('--ball-ink') || '#1B1618' };
-  sprites.clear();
+  clearSprites();
 }
 
 function resize(){
   const r = els.wrap.getBoundingClientRect();
-  const nd = Math.min(2.5, window.devicePixelRatio || 1);
-  if(nd !== dpr) sprites.clear();
+  // With thousands of balls, draw the drum at a slightly lower resolution to keep it smooth
+  const nd = Math.min(loadBucket ? 1.5 : 2.5, window.devicePixelRatio || 1);
+  if(nd !== dpr) clearSprites();
   dpr = nd;
+  forceRender = true;
   W = Math.max(1, r.width); H = Math.max(1, r.height);
   els.canvas.width = Math.round(W * dpr);
   els.canvas.height = Math.round(H * dpr);
@@ -1492,12 +1497,13 @@ function resize(){
   side = { R:RS, ox:W / 2 - (x0 + x1) / 2 * RS, oy:H / 2 - (y0 + y1) / 2 * RS };
 }
 
-function sprite(color, label, r){
+function sprite(color, label, r, shade){
+  shade = shade || 0;
   const rq = Math.max(1.5, Math.round(r * 2) / 2);
-  const key = color + '|' + label + '|' + rq;
+  const key = color + '|' + label + '|' + rq + '|' + shade;
   let s = sprites.get(key);
   if(s) return s;
-  if(sprites.size > 800) sprites.clear();
+  if(sprites.size > 3000) sprites.clear();
   const px = Math.ceil((rq * 2 + 2) * dpr);
   const cv = document.createElement('canvas');
   cv.width = cv.height = px;
@@ -1519,9 +1525,29 @@ function sprite(color, label, r){
     g.textAlign = 'center'; g.textBaseline = 'middle';
     g.fillText(label, o, o + fs * 0.05);
   }
+  if(shade){
+    g.globalCompositeOperation = 'source-atop';
+    g.fillStyle = `rgba(14,11,12,${(shade * 0.09).toFixed(2)})`;
+    g.fillRect(0, 0, o * 2, o * 2);
+    g.globalCompositeOperation = 'source-over';
+  }
   s = { c:cv, size:px / dpr };
   sprites.set(key, s);
   return s;
+}
+// Fast path for the drum: each person keeps their own small cache of ready-made ball images
+function infoSprite(info, r, shade){
+  if(info.gen !== spriteGen){ info.cache = new Map(); info.gen = spriteGen; }
+  const rq = Math.max(1.5, Math.round(r * 2) / 2), lab = r >= 8;
+  const key = rq * 32 + shade * 2 + (lab ? 1 : 0);
+  let sp = info.cache.get(key);
+  if(!sp){ sp = sprite(info.color, lab ? info.label : '', rq, shade); info.cache.set(key, sp); }
+  return sp;
+}
+function blit(sp, x, y, alpha){
+  const h = sp.size / 2;
+  if(alpha < 1){ ctx.globalAlpha = alpha; ctx.drawImage(sp.c, x - h, y - h, sp.size, sp.size); ctx.globalAlpha = 1; }
+  else ctx.drawImage(sp.c, x - h, y - h, sp.size, sp.size);
 }
 function drawBall(color, label, x, y, r, alpha){
   if(r < 0.6) return;
@@ -1561,24 +1587,36 @@ function syncBalls(){
     if(!have.has(b.eid)) have.set(b.eid, []);
     have.get(b.eid).push(b);
   }
+  let removed = 0;
   for(const [eid, arr] of have){
     const w = want.get(eid) || 0;
-    for(let i = w; i < arr.length; i++) arr[i].dying = true;
+    for(let i = w; i < arr.length; i++){ arr[i].dying = true; removed++; }
   }
   let count = 0;
   for(const w of want.values()) count += w;
   const n = Math.max(1, count);
+  const prevRR = targetRR;
   rrFront = clamp(Math.sqrt(0.32 / n), 0.02, 0.15);
   rrSide = clamp(Math.cbrt(0.24 * SIDE.hl / n), 0.035, 0.17);
   targetRR = state.view === 'side' ? rrSide : rrFront;
+  let adding = 0;
+  for(const [eid, w] of want) adding += Math.max(0, w - (have.get(eid) || []).length);
+  // A big batch dropped from one spot piles up and stalls the drum, so spread it through the drum instead
+  const mode = firstSync || adding > 150 ? 'scatter' : 'drop';
   for(const [eid, w] of want){
     const k = (have.get(eid) || []).length;
-    for(let i = k; i < w; i++) balls.push(newBall(eid, firstSync ? 'scatter' : 'drop'));
+    for(let i = k; i < w; i++) balls.push(newBall(eid, mode));
   }
   firstSync = false;
+  if(adding || removed || prevRR !== targetRR) wake();
+  const bucket = count > 2500 ? 1 : 0;
+  if(bucket !== loadBucket){ loadBucket = bucket; resize(); }
 }
 
+// Turning: lively bounces. At rest: soft, heavily damped contacts so a big pile settles instead of jiggling.
+let restit = 0.55;
 function step(list, h){
+  restit = spin > 0.02 ? 0.55 : 0.08;
   if(state.view === 'side') stepSide(list, h);
   else stepFront(list, h);
 }
@@ -1595,7 +1633,7 @@ function stepFront(list, h){
       b.vx += -b.y * 1.4 * s * h;
       b.vy += b.x * 1.4 * s * h;
     }
-    const damp = 1 - (jet ? 0.3 : 1.2) * h;
+    const damp = 1 - (jet ? 0.3 : 4) * h;
     b.vx *= damp; b.vy *= damp;
     b.x += b.vx * h; b.y += b.vy * h;
   }
@@ -1603,26 +1641,35 @@ function stepFront(list, h){
   wallsFront(list, s);
 }
 
+// Spatial grid kept in typed arrays: each cell holds a linked list of ball indices, rebuilt every step
+let gHead = new Int32Array(1024), gNext = new Int32Array(1024), gCell = new Int32Array(1024);
+function gridReset(cells, n){
+  if(gHead.length < cells) gHead = new Int32Array(Math.ceil(cells * 1.25));
+  if(gNext.length < n){ gNext = new Int32Array(Math.ceil(n * 1.5)); gCell = new Int32Array(gNext.length); }
+  gHead.fill(-1, 0, cells);
+}
 function collide(list){
+  const n = list.length;
+  if(n < 2) return;
   let maxr = 0.01;
-  for(const b of list) if(b.rr > maxr) maxr = b.rr;
-  const cs = maxr * 2;
-  const grid = new Map();
-  for(let i = 0; i < list.length; i++){
+  for(let i = 0; i < n; i++){ const r = list[i].rr; if(r > maxr) maxr = r; }
+  const off = 1.1, inv = 1 / (maxr * 2), nc = Math.ceil(2 * off * inv) + 1;
+  gridReset(nc * nc, n);
+  for(let i = 0; i < n; i++){
     const b = list[i];
-    b._gx = Math.floor((b.x + 2) / cs); b._gy = Math.floor((b.y + 2) / cs);
-    const k = b._gx * 4096 + b._gy;
-    let a = grid.get(k);
-    if(!a) grid.set(k, a = []);
-    a.push(i);
+    let cx = ((b.x + off) * inv) | 0, cy = ((b.y + off) * inv) | 0;
+    if(cx < 0) cx = 0; else if(cx >= nc) cx = nc - 1;
+    if(cy < 0) cy = 0; else if(cy >= nc) cy = nc - 1;
+    const c = cx * nc + cy;
+    gCell[i] = c; gNext[i] = gHead[c]; gHead[c] = i;
   }
-  for(let i = 0; i < list.length; i++){
-    const b = list[i];
-    for(let dx = -1; dx <= 1; dx++){
-      for(let dy = -1; dy <= 1; dy++){
-        const a = grid.get((b._gx + dx) * 4096 + (b._gy + dy));
-        if(!a) continue;
-        for(const j of a){
+  for(let i = 0; i < n; i++){
+    const b = list[i], c = gCell[i], cx = (c / nc) | 0, cy = c - cx * nc;
+    const x0 = cx > 0 ? cx - 1 : 0, x1 = cx < nc - 1 ? cx + 1 : cx;
+    const y0 = cy > 0 ? cy - 1 : 0, y1 = cy < nc - 1 ? cy + 1 : cy;
+    for(let gx = x0; gx <= x1; gx++){
+      for(let gy = y0; gy <= y1; gy++){
+        for(let j = gHead[gx * nc + gy]; j !== -1; j = gNext[j]){
           if(j <= i) continue;
           const o = list[j];
           let nx = o.x - b.x, ny = o.y - b.y;
@@ -1635,7 +1682,7 @@ function collide(list){
           b.x -= nx * pen; b.y -= ny * pen; o.x += nx * pen; o.y += ny * pen;
           const rv = (o.vx - b.vx) * nx + (o.vy - b.vy) * ny;
           if(rv < 0){
-            const imp = -(1 + 0.55) * rv * 0.5;
+            const imp = -(1 + restit) * rv * 0.5;
             b.vx -= imp * nx; b.vy -= imp * ny; o.vx += imp * nx; o.vy += imp * ny;
           }
         }
@@ -1651,7 +1698,8 @@ function wallsFront(list, s){
     const d = Math.sqrt(d2), nx = b.x / d, ny = b.y / d;
     b.x = nx * lim; b.y = ny * lim;
     const vn = b.vx * nx + b.vy * ny;
-    if(vn > 0){ b.vx -= 1.45 * vn * nx; b.vy -= 1.45 * vn * ny; }
+    const e = s > 0.02 ? 1.45 : 1.08;
+    if(vn > 0){ b.vx -= e * vn * nx; b.vy -= e * vn * ny; }
     const tx = -ny, ty = nx, vt = b.vx * tx + b.vy * ty;
     if(s > 0.02){
       const wv = 2.88 * s, k = 0.12;
@@ -1672,7 +1720,7 @@ function stepSide(list, h){
       b.vy += (Math.random() - 0.5) * 4 * s * h;
       b.vax += (Math.random() - 0.5) * 5 * s * h;
     }
-    const damp = 1 - (on ? 0.35 : 1.2) * h;
+    const damp = 1 - (on ? 0.35 : 4) * h;
     b.vx *= damp; b.vy *= damp; b.vax *= damp;
     b.x += b.vx * h; b.y += b.vy * h; b.ax += b.vax * h;
   }
@@ -1681,42 +1729,48 @@ function stepSide(list, h){
 }
 
 function collide3(list){
+  const n = list.length;
+  if(n < 2) return;
   let maxr = 0.01;
-  for(const b of list) if(b.rr > maxr) maxr = b.rr;
-  const cs = maxr * 2;
-  const grid = new Map();
-  for(let i = 0; i < list.length; i++){
+  for(let i = 0; i < n; i++){ const r = list[i].rr; if(r > maxr) maxr = r; }
+  const off = 1.1, offz = SIDE.hl + 0.1, inv = 1 / (maxr * 2);
+  const nc = Math.ceil(2 * off * inv) + 1, nz = Math.ceil(2 * offz * inv) + 1;
+  gridReset(nc * nc * nz, n);
+  for(let i = 0; i < n; i++){
     const b = list[i];
-    b._gx = Math.floor((b.x + 2) / cs); b._gy = Math.floor((b.y + 2) / cs); b._gz = Math.floor((b.ax + 2) / cs);
-    const k = (b._gx * 256 + b._gy) * 256 + b._gz;
-    let a = grid.get(k);
-    if(!a) grid.set(k, a = []);
-    a.push(i);
+    let cx = ((b.x + off) * inv) | 0, cy = ((b.y + off) * inv) | 0, cz = ((b.ax + offz) * inv) | 0;
+    if(cx < 0) cx = 0; else if(cx >= nc) cx = nc - 1;
+    if(cy < 0) cy = 0; else if(cy >= nc) cy = nc - 1;
+    if(cz < 0) cz = 0; else if(cz >= nz) cz = nz - 1;
+    const c = (cx * nc + cy) * nz + cz;
+    gCell[i] = c; gNext[i] = gHead[c]; gHead[c] = i;
   }
-  for(let i = 0; i < list.length; i++){
-    const b = list[i];
-    for(let dx = -1; dx <= 1; dx++){
-      for(let dy = -1; dy <= 1; dy++){
-        for(let dz = -1; dz <= 1; dz++){
-          const a = grid.get(((b._gx + dx) * 256 + (b._gy + dy)) * 256 + (b._gz + dz));
-          if(!a) continue;
-          for(const j of a){
+  for(let i = 0; i < n; i++){
+    const b = list[i], c = gCell[i], cz = c % nz, t = (c - cz) / nz, cy = t % nc, cx = (t - cy) / nc;
+    const x0 = cx > 0 ? cx - 1 : 0, x1 = cx < nc - 1 ? cx + 1 : cx;
+    const y0 = cy > 0 ? cy - 1 : 0, y1 = cy < nc - 1 ? cy + 1 : cy;
+    const z0 = cz > 0 ? cz - 1 : 0, z1 = cz < nz - 1 ? cz + 1 : cz;
+    for(let gx = x0; gx <= x1; gx++){
+      for(let gy = y0; gy <= y1; gy++){
+        const row = (gx * nc + gy) * nz;
+        for(let gz = z0; gz <= z1; gz++){
+          for(let j = gHead[row + gz]; j !== -1; j = gNext[j]){
             if(j <= i) continue;
             const o = list[j];
-            let nx = o.x - b.x, ny = o.y - b.y, nz = o.ax - b.ax;
-            const rs = b.rr + o.rr, d2 = nx * nx + ny * ny + nz * nz;
+            let nx = o.x - b.x, ny = o.y - b.y, nzv = o.ax - b.ax;
+            const rs = b.rr + o.rr, d2 = nx * nx + ny * ny + nzv * nzv;
             if(d2 >= rs * rs) continue;
             let dist;
-            if(d2 < 1e-12){ const ang = Math.random() * TAU; nx = Math.cos(ang); ny = 0; nz = Math.sin(ang); dist = 0; }
-            else { dist = Math.sqrt(d2); nx /= dist; ny /= dist; nz /= dist; }
+            if(d2 < 1e-12){ const ang = Math.random() * TAU; nx = Math.cos(ang); ny = 0; nzv = Math.sin(ang); dist = 0; }
+            else { dist = Math.sqrt(d2); nx /= dist; ny /= dist; nzv /= dist; }
             const pen = (rs - dist) * 0.5;
-            b.x -= nx * pen; b.y -= ny * pen; b.ax -= nz * pen;
-            o.x += nx * pen; o.y += ny * pen; o.ax += nz * pen;
-            const rv = (o.vx - b.vx) * nx + (o.vy - b.vy) * ny + (o.vax - b.vax) * nz;
+            b.x -= nx * pen; b.y -= ny * pen; b.ax -= nzv * pen;
+            o.x += nx * pen; o.y += ny * pen; o.ax += nzv * pen;
+            const rv = (o.vx - b.vx) * nx + (o.vy - b.vy) * ny + (o.vax - b.vax) * nzv;
             if(rv < 0){
-              const imp = -(1 + 0.55) * rv * 0.5;
-              b.vx -= imp * nx; b.vy -= imp * ny; b.vax -= imp * nz;
-              o.vx += imp * nx; o.vy += imp * ny; o.vax += imp * nz;
+              const imp = -(1 + restit) * rv * 0.5;
+              b.vx -= imp * nx; b.vy -= imp * ny; b.vax -= imp * nzv;
+              o.vx += imp * nx; o.vy += imp * ny; o.vax += imp * nzv;
             }
           }
         }
@@ -1733,7 +1787,8 @@ function wallsSide(list, s){
       const d = Math.sqrt(d2), nx = b.x / d, ny = b.y / d;
       b.x = nx * lim; b.y = ny * lim;
       const vn = b.vx * nx + b.vy * ny;
-      if(vn > 0){ b.vx -= 1.4 * vn * nx; b.vy -= 1.4 * vn * ny; }
+      const e = on ? 1.4 : 1.08;
+      if(vn > 0){ b.vx -= e * vn * nx; b.vy -= e * vn * ny; }
       const tx = -ny, ty = nx, vt = b.vx * tx + b.vy * ty;
       const k = on ? 0.16 : 0.03, target = on ? wv : 0;
       b.vx += tx * (target - vt) * k; b.vy += ty * (target - vt) * k;
@@ -1806,17 +1861,22 @@ function update(dt){
   }
   drumAngle += omega() * spin * dt;
 
+  let changing = false;
   for(let i = balls.length - 1; i >= 0; i--){
     const b = balls[i];
     if(b.dying){
       b.alpha -= dt * 2.6;
       b.rr *= Math.max(0, 1 - dt * 1.5);
       if(b.alpha <= 0) balls.splice(i, 1);
+      changing = true;
       continue;
     }
-    if(b.alpha < 1) b.alpha = Math.min(1, b.alpha + dt * 4);
-    b.rr += (targetRR - b.rr) * Math.min(1, dt * 5);
+    if(b.alpha < 1){ b.alpha = Math.min(1, b.alpha + dt * 4); changing = true; }
+    const dr = targetRR - b.rr;
+    if(dr > 1e-5 || dr < -1e-5){ b.rr += dr * Math.min(1, dt * 5); changing = true; }
+    else b.rr = targetRR;
   }
+  ballsChanging = changing;
   if(oldTray){ oldTray.alpha -= dt * 3; if(oldTray.alpha <= 0) oldTray = null; }
 
   if(spin > 0.02){
@@ -1910,10 +1970,12 @@ function renderFront(){
   gb.addColorStop(1, 'rgba(255,255,255,0.015)');
   ctx.fillStyle = gb; ctx.fill();
 
-  for(const b of balls){
-    const info = infoMap.get(b.eid);
+  for(let i = 0, n = balls.length; i < n; i++){
+    const b = balls[i], info = infoMap.get(b.eid);
     if(!info) continue;
-    drawBall(info.color, info.label, cx + b.x * R, cy + b.y * R, b.rr * R, b.alpha);
+    const r = b.rr * R;
+    if(r < 0.6) continue;
+    blit(infoSprite(info, r, 0), cx + b.x * R, cy + b.y * R, b.alpha);
   }
 
   if(winBall && phase === 'extracting'){
@@ -2116,6 +2178,7 @@ function traySide(){
   ctx.lineWidth = Math.max(2.5, R * 0.022); ctx.strokeStyle = C.accent; ctx.stroke();
 }
 
+let sX = new Float32Array(0), sY = new Float32Array(0), sD = new Float32Array(0), sOrder = new Int32Array(0);
 function renderSide(){
   const R = side.R, hl = SIDE.hl;
   const c0 = P(0, 0, 0);
@@ -2138,22 +2201,35 @@ function renderSide(){
   ctx.lineCap = 'butt';
   if(!hatchFront) hatch(hA, hB, false);
 
-  const list = [];
-  for(const b of balls){
-    const info = infoMap.get(b.eid);
-    if(!info) continue;
-    const p = P(b.ax, b.x, b.y);
-    list.push({ d:p[2], x:p[0], y:p[1], b, info });
+  const n = balls.length;
+  if(sX.length < n){ const m = Math.ceil(n * 1.5) + 16; sX = new Float32Array(m); sY = new Float32Array(m); sD = new Float32Array(m); }
+  const pc = SIDE.pc, ps = SIDE.ps, ec = SIDE.ec, es = SIDE.es, ox = side.ox, oy = side.oy;
+  for(let i = 0; i < n; i++){
+    const b = balls[i], Y = -b.y, D = b.ax * ps + b.x * pc;
+    sX[i] = ox + (b.ax * pc - b.x * ps) * R;
+    sY[i] = oy + (D * es - Y * ec) * R;
+    sD[i] = Y * es + D * ec;
   }
-  list.sort((m, n) => m.d - n.d);
-  for(const it of list){
-    const r = it.b.rr * R * (1 + it.d * 0.05);
-    drawBall(it.info.color, it.info.label, it.x, it.y, r, it.b.alpha);
-    const sh = clamp((0.25 - it.d) * 0.2, 0, 0.38) * it.b.alpha;
-    if(sh > 0.02 && r >= 0.6){
-      ctx.beginPath(); ctx.arc(it.x, it.y, r, 0, TAU);
-      ctx.fillStyle = `rgba(14,11,12,${sh.toFixed(3)})`; ctx.fill();
+  // Back-to-front order. Last frame's order is nearly right, so a quick insertion pass finishes it.
+  if(sOrder.length !== n){
+    sOrder = new Int32Array(n);
+    for(let i = 0; i < n; i++) sOrder[i] = i;
+    sOrder.sort((a, c) => sD[a] - sD[c]);
+  } else {
+    for(let i = 1; i < n; i++){
+      const v = sOrder[i], d = sD[v];
+      let j = i - 1;
+      while(j >= 0 && sD[sOrder[j]] > d){ sOrder[j + 1] = sOrder[j]; j--; }
+      sOrder[j + 1] = v;
     }
+  }
+  for(let k = 0; k < n; k++){
+    const i = sOrder[k], b = balls[i], info = infoMap.get(b.eid);
+    if(!info) continue;
+    const d = sD[i], r = b.rr * R * (1 + d * 0.05);
+    if(r < 0.6) continue;
+    const shade = Math.round(clamp((0.25 - d) * 0.2, 0, 0.36) / 0.09);
+    blit(infoSprite(info, r, shade), sX[i], sY[i], b.alpha);
   }
 
   if(winBall && phase === 'extracting'){
@@ -2174,19 +2250,40 @@ function renderSide(){
   traySide();
 }
 
-let last = performance.now(), acc = 0;
+let last = performance.now(), acc = 0, asleep = false, calm = 0, restT = 0, forceRender = true, ballsChanging = false;
+function wake(){ asleep = false; calm = 0; restT = 0; forceRender = true; }
 function frame(now){
   const dt = Math.min(0.05, (now - last) / 1000);
   last = now;
   update(dt);
-  acc += dt;
-  const live = [];
-  for(const b of balls) if(!b.dying) live.push(b);
-  const h = state.view === 'side' && live.length > 450 ? 1 / 120 : 1 / 180;
-  let n = 0;
-  while(acc >= h && n < 12){ step(live, h); acc -= h; n++; }
-  if(n === 12) acc = 0;
-  render();
+  const settled = (phase === 'idle' || (phase === 'landed' && !pendingReveal)) && spin <= 0.0001;
+  if(!settled || ballsChanging) asleep = false;
+  if(!asleep){
+    acc += dt;
+    const live = [];
+    for(const b of balls) if(!b.dying) live.push(b);
+    const n = live.length;
+    // Thousands of balls: take fewer, larger physics steps so each frame stays on time
+    const h = n > 2400 ? 1 / 90 : n > 900 ? 1 / 120 : 1 / 180;
+    const maxSteps = Math.ceil(0.034 / h);
+    let k = 0;
+    while(acc >= h && k < maxSteps){ step(live, h); acc -= h; k++; }
+    if(k === maxSteps) acc = 0;
+    // Once the pile has settled, stop simulating until something changes. A deep pile never goes
+    // perfectly still, so it also rests after a couple of seconds without the drum turning.
+    if(settled && !ballsChanging){
+      restT += dt;
+      let v2 = 0;
+      for(let i = 0; i < n; i++){ const b = live[i]; v2 += b.vx * b.vx + b.vy * b.vy + b.vax * b.vax; }
+      calm = v2 / Math.max(1, n) < 0.0006 ? calm + 1 : 0;
+      if(calm > 40 || restT > 2.5){ asleep = true; acc = 0; }
+    } else { calm = 0; restT = 0; }
+    forceRender = true;
+  }
+  if(forceRender || ballsChanging || oldTray || glow > 0.001 || !settled){
+    render();
+    forceRender = false;
+  }
   requestAnimationFrame(frame);
 }
 
@@ -2195,7 +2292,9 @@ function setView(v){
   if(v === state.view || !(phase === 'idle' || phase === 'landed')) return;
   state.view = v;
   if(v === 'side') for(const b of balls){ b.ax = randAx(); b.vax = 0; }
+  else for(const b of balls) b.vax = 0;
   targetRR = v === 'side' ? rrSide : rrFront;
+  wake();
   renderViewBtns();
   savePrefs();
   refresh();
@@ -2529,7 +2628,7 @@ resize();
 new ResizeObserver(resize).observe(els.wrap);
 window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', readColors);
 new MutationObserver(readColors).observe(document.documentElement, { attributes:true, attributeFilter:['data-theme'] });
-if(document.fonts && document.fonts.ready) document.fonts.ready.then(() => sprites.clear());
+if(document.fonts && document.fonts.ready) document.fonts.ready.then(() => clearSprites());
 renderRows();
 requestAnimationFrame(t => { last = t; requestAnimationFrame(frame); });
 })();
